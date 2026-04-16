@@ -1,0 +1,29 @@
+# Zig build artifacts
+.zig-cache/
+zig-out/
+
+# Editor / IDE
+.vscode/
+.idea/
+*.swp
+*~
+
+# OpenClaw agent workspace artifacts
+.openclaw/
+**/.openclaw/
+**/workspace-state.json
+**/sessions.json
+**/.dreams/
+**/.clawhub/
+
+# Secrets / credentials (never commit these)
+*.env
+*.key
+*.token
+auth-profiles.json
+auth-state.json
+device-auth.json
+
+# OS
+.DS_Store
+Thumbs.db

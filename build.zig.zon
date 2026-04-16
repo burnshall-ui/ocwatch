@@ -1,0 +1,8 @@
+.{
+    .name = .ocwatch,
+    .fingerprint = 0xf8db23bdb711645d,
+    .version = "0.1.0",
+    .minimum_zig_version = "0.14.0",
+    .dependencies = .{},
+    .paths = .{"."},
+}
