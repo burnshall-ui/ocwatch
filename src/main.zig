@@ -129,7 +129,7 @@ pub fn main(io: std.process.Init.Minimal) !void {
         const ts = timestamp();
         const line = std.fmt.bufPrint(&msg, "{s}  {s:<12}  watching {s} ({d} dirs) → {s}\n", .{
             &ts, "START", watch_dir, ctx.map.count, log_path,
-        }) catch &msg;
+        }) catch return error.StartupLineFormat;
         writeLine(&ctx, line);
     }
 
@@ -262,8 +262,8 @@ fn handleEvent(ctx: *Context, ev: *const linux.inotify_event) void {
         }
         return;
     }
-    // Other dir events: only DELETE is interesting (let it fall through to log).
-    if (is_dir and (ev.mask & linux.IN.DELETE) == 0) return;
+    // Other dir events: only DELETE / DELETE_SELF are interesting (let them fall through to log).
+    if (is_dir and (ev.mask & (linux.IN.DELETE | linux.IN.DELETE_SELF)) == 0) return;
 
     const is_write = (ev.mask & linux.IN.CLOSE_WRITE) != 0 or (ev.mask & linux.IN.MOVED_TO) != 0;
     const is_delete = (ev.mask & linux.IN.DELETE) != 0 or (ev.mask & linux.IN.DELETE_SELF) != 0;
