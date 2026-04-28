@@ -89,6 +89,13 @@ pub fn main(io: std.process.Init.Minimal) !void {
     @memcpy(log_path_z[0..log_path.len], log_path);
     log_path_z[log_path.len] = 0;
 
+    // Best-effort: create the log file's parent directory tree so the default
+    // `<watch-dir>/logs/ocwatch.log` works on a fresh install. Errors are
+    // ignored — if mkdir fails for a real reason, open() below will surface it.
+    if (mem.lastIndexOfScalar(u8, log_path, '/')) |slash| {
+        if (slash > 0) mkdirP(log_path[0..slash]);
+    }
+
     const log_fd_rc = linux.open(
         @ptrCast(&log_path_z),
         linux.O{ .ACCMODE = .WRONLY, .CREAT = true, .APPEND = true, .CLOEXEC = true },
@@ -170,8 +177,13 @@ fn addWatchRecursive(ctx: *Context, path: []const u8) !void {
     const wd_rc = linux.inotify_add_watch(@intCast(ctx.ifd), @ptrCast(&path_z), WATCH_MASK);
     const wd: i32 = switch (linux.errno(wd_rc)) {
         .SUCCESS => @intCast(wd_rc),
+        // Benign: dir vanished mid-walk or we lack search permission on a single
+        // entry. These happen routinely with concurrent agents and don't merit a log line.
         .NOENT, .ACCES => return,
-        else => return,
+        else => |err| {
+            logErr(ctx, "WATCH-ERR", err, path);
+            return;
+        },
     };
 
     switch (ctx.map.add(wd, path)) {
@@ -192,7 +204,11 @@ fn addWatchRecursive(ctx: *Context, path: []const u8) !void {
     );
     const dir_fd: i32 = switch (linux.errno(dir_fd_rc)) {
         .SUCCESS => @intCast(dir_fd_rc),
-        else => return,
+        .NOENT, .ACCES => return,
+        else => |err| {
+            logErr(ctx, "OPEN-ERR", err, path);
+            return;
+        },
     };
     defer _ = linux.close(@intCast(dir_fd));
 
@@ -210,10 +226,19 @@ fn addWatchRecursive(ctx: *Context, path: []const u8) !void {
             const ent: *const linux.dirent64 = @ptrCast(@alignCast(&dents_buf[bpos]));
             bpos += ent.reclen;
 
-            if (ent.type != linux.DT.DIR) continue;
-            const name_ptr: [*]const u8 = @ptrCast(&ent.name);
+            const name_ptr: [*:0]const u8 = @ptrCast(&ent.name);
             const name = mem.sliceTo(name_ptr, 0);
             if (mem.eql(u8, name, ".") or mem.eql(u8, name, "..")) continue;
+
+            // Some filesystems (older NFS, certain FUSE backends) return DT_UNKNOWN
+            // and force a stat. Fall back to statx in that case so we don't silently
+            // skip subdirs.
+            const is_subdir = switch (ent.type) {
+                linux.DT.DIR => true,
+                linux.DT.UNKNOWN => isDirAt(dir_fd, name_ptr),
+                else => false,
+            };
+            if (!is_subdir) continue;
 
             // Skip hidden dirs that aren't openclaw-related
             if (name.len > 0 and name[0] == '.') {
@@ -242,6 +267,13 @@ fn handleEvent(ctx: *Context, ev: *const linux.inotify_event) void {
     // don't resolve to a stale path.
     if ((ev.mask & linux.IN.IGNORED) != 0) {
         _ = ctx.map.remove(ev.wd);
+        return;
+    }
+
+    // Kernel queue overflowed (fs.inotify.max_queued_events exceeded). Events
+    // were lost — log so the gap in the trace is visible to whoever reads it.
+    if ((ev.mask & linux.IN.Q_OVERFLOW) != 0) {
+        logSimple(ctx, "Q-OVERFLOW", "kernel inotify queue exceeded; events lost");
         return;
     }
 
@@ -330,6 +362,44 @@ fn logSimple(ctx: *Context, tag: []const u8, payload: []const u8) void {
 
 fn writeStr(fd: i32, s: []const u8) void {
     _ = linux.write(@intCast(fd), s.ptr, s.len);
+}
+
+fn logErr(ctx: *Context, tag: []const u8, err: linux.E, path: []const u8) void {
+    var buf: [MAX_PATH + 64]u8 = undefined;
+    const payload = std.fmt.bufPrint(&buf, "{s}: {s}", .{ @tagName(err), path }) catch path;
+    logSimple(ctx, tag, payload);
+}
+
+fn isDirAt(dir_fd: i32, name: [*:0]const u8) bool {
+    var stx: linux.Statx = undefined;
+    const rc = linux.statx(
+        @intCast(dir_fd),
+        @ptrCast(name),
+        linux.AT.SYMLINK_NOFOLLOW,
+        linux.STATX{ .TYPE = true },
+        &stx,
+    );
+    if (linux.errno(rc) != .SUCCESS) return false;
+    return (stx.mode & linux.S.IFMT) == linux.S.IFDIR;
+}
+
+fn mkdirP(path: []const u8) void {
+    if (path.len == 0 or path.len >= MAX_PATH) return;
+    var buf: [MAX_PATH]u8 = undefined;
+    @memcpy(buf[0..path.len], path);
+    buf[path.len] = 0;
+
+    // mkdir each '/'-prefix in turn; EEXIST and other errors are ignored — the
+    // subsequent open() of the log file is the real signal.
+    var i: usize = 1;
+    while (i < path.len) : (i += 1) {
+        if (path[i] == '/') {
+            buf[i] = 0;
+            _ = linux.mkdir(@ptrCast(&buf), 0o755);
+            buf[i] = '/';
+        }
+    }
+    _ = linux.mkdir(@ptrCast(&buf), 0o755);
 }
 
 fn nameFromEvent(ev: *const linux.inotify_event) []const u8 {
