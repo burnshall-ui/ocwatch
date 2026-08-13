@@ -6,6 +6,7 @@
 </p>
 
 <p align="center">
+  <a href="https://github.com/burnshall-ui/ocwatch/actions/workflows/ci.yml"><img src="https://github.com/burnshall-ui/ocwatch/actions/workflows/ci.yml/badge.svg" alt="CI" /></a>
   <img src="https://img.shields.io/badge/Zig-0.16-F7A41D?logo=zig&logoColor=white" alt="Zig 0.16" />
   <img src="https://img.shields.io/badge/Linux-inotify-FCC624?logo=linux&logoColor=black" alt="Linux inotify" />
   <img src="https://img.shields.io/badge/libc-none-1f6feb" alt="No libc" />
@@ -48,6 +49,22 @@ Binary lands at `zig-out/bin/ocwatch`.
 ```sh
 cp zig-out/bin/ocwatch ~/.local/bin/
 ```
+
+## Tests
+
+```sh
+zig build test --summary all   # unit tests
+./tests/integration.sh         # end-to-end against a live kernel
+```
+
+The unit tests cover event-mask decoding, including a guard that `WATCH_MASK`
+subscribes to exactly the events the logger can name — adding a bit to one
+without the other would log real events as `UNKNOWN`.
+
+The integration script builds a directory tree, provokes real inotify events and
+asserts the log: both halves of an atomic rename arrive as a balanced pair,
+directories created after startup get watched too, and the timestamp format
+stays greppable.
 
 ## Usage
 
