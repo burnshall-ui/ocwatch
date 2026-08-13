@@ -1,4 +1,19 @@
-# ocwatch
+<h1 align="center">o c w a t c h</h1>
+
+<p align="center">
+  <strong>Filesystem write monitor for <a href="https://openclaw.dev">OpenClaw</a> agents</strong><br/>
+  <em>Catches atomic renames the moment they land — no polling, no libc, no daemon.</em>
+</p>
+
+<p align="center">
+  <img src="https://img.shields.io/badge/Zig-0.16-F7A41D?logo=zig&logoColor=white" alt="Zig 0.16" />
+  <img src="https://img.shields.io/badge/Linux-inotify-FCC624?logo=linux&logoColor=black" alt="Linux inotify" />
+  <img src="https://img.shields.io/badge/libc-none-1f6feb" alt="No libc" />
+  <img src="https://img.shields.io/badge/polling-none-1f6feb" alt="No polling" />
+  <img src="https://img.shields.io/badge/License-MIT-blue" alt="MIT License" />
+</p>
+
+---
 
 Filesystem write monitor for [OpenClaw](https://openclaw.dev) agents. Uses Linux `inotify` to watch `~/.openclaw/` recursively and logs every write, atomic rename, and delete with millisecond timestamps.
 
