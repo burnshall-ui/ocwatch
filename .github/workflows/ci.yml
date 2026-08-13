@@ -1,0 +1,40 @@
+name: CI
+
+on:
+  push:
+    branches: ["main", "master"]
+  pull_request:
+    branches: ["main", "master"]
+
+env:
+  # Keep in sync with minimum_zig_version in build.zig.zon.
+  ZIG_VERSION: 0.16.0
+
+jobs:
+  build-and-test:
+    # ocwatch is Linux-only by design: inotify, getdents64, statx.
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Zig
+        uses: mlugg/setup-zig@v2
+        with:
+          version: ${{ env.ZIG_VERSION }}
+
+      - name: Check formatting
+        run: zig fmt --check .
+
+      - name: Build
+        run: zig build -Doptimize=ReleaseFast
+
+      - name: Unit tests
+        run: zig build test --summary all
+
+      # Exercises the parts that only exist against a live kernel: recursive
+      # watch setup, both halves of an atomic rename, and watches added for
+      # directories created after startup.
+      - name: Integration test
+        run: ./tests/integration.sh

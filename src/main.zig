@@ -446,3 +446,75 @@ fn timestamp() [23]u8 {
     }) catch {};
     return buf;
 }
+
+// ──────────────────────────────────────────────
+// Tests
+//
+// eventStr is the only branch-heavy pure function here; everything else is
+// syscall-bound and covered by the integration check in CI instead.
+// ──────────────────────────────────────────────
+
+const testing = std.testing;
+
+test "eventStr names every mask we subscribe to" {
+    try testing.expectEqualStrings("WRITE", eventStr(linux.IN.CLOSE_WRITE));
+    try testing.expectEqualStrings("RENAME-TO", eventStr(linux.IN.MOVED_TO));
+    try testing.expectEqualStrings("RENAME-FROM", eventStr(linux.IN.MOVED_FROM));
+    try testing.expectEqualStrings("DELETE-SELF", eventStr(linux.IN.DELETE_SELF));
+    try testing.expectEqualStrings("DELETE", eventStr(linux.IN.DELETE));
+    try testing.expectEqualStrings("CREATE", eventStr(linux.IN.CREATE));
+}
+
+test "eventStr separates directory deletions from file deletions" {
+    try testing.expectEqualStrings("DELETE-DIR", eventStr(linux.IN.DELETE | linux.IN.ISDIR));
+    try testing.expectEqualStrings("DELETE", eventStr(linux.IN.DELETE));
+    // ISDIR on its own is not a deletion.
+    try testing.expectEqualStrings("CREATE", eventStr(linux.IN.CREATE | linux.IN.ISDIR));
+}
+
+test "eventStr prefers the write over co-occurring bits" {
+    // The kernel can set several bits at once; a completed write is the most
+    // specific thing we can say about the file, so it has to win.
+    const combined = linux.IN.CLOSE_WRITE | linux.IN.CREATE | linux.IN.ISDIR;
+    try testing.expectEqualStrings("WRITE", eventStr(combined));
+}
+
+test "eventStr does not invent a name for masks we ignore" {
+    try testing.expectEqualStrings("UNKNOWN", eventStr(0));
+    try testing.expectEqualStrings("UNKNOWN", eventStr(linux.IN.ACCESS));
+    try testing.expectEqualStrings("UNKNOWN", eventStr(linux.IN.OPEN));
+}
+
+test "WATCH_MASK subscribes to exactly the events eventStr can name" {
+    // Drift guard: adding a bit to WATCH_MASK without teaching eventStr about
+    // it would log the event as UNKNOWN.
+    const named = [_]u32{
+        linux.IN.CLOSE_WRITE,
+        linux.IN.MOVED_TO,
+        linux.IN.MOVED_FROM,
+        linux.IN.CREATE,
+        linux.IN.DELETE,
+        linux.IN.DELETE_SELF,
+    };
+    var covered: u32 = 0;
+    for (named) |bit| {
+        try testing.expect(!std.mem.eql(u8, "UNKNOWN", eventStr(bit)));
+        covered |= bit;
+    }
+    try testing.expectEqual(WATCH_MASK, covered);
+}
+
+test "timestamp has the fixed width the log format relies on" {
+    const ts = timestamp();
+    try testing.expectEqual(@as(usize, 23), ts.len);
+    // YYYY-MM-DDTHH:MM:SS.mmm
+    try testing.expectEqual(@as(u8, '-'), ts[4]);
+    try testing.expectEqual(@as(u8, '-'), ts[7]);
+    try testing.expectEqual(@as(u8, 'T'), ts[10]);
+    try testing.expectEqual(@as(u8, ':'), ts[13]);
+    try testing.expectEqual(@as(u8, ':'), ts[16]);
+    try testing.expectEqual(@as(u8, '.'), ts[19]);
+    for ([_]usize{ 0, 1, 2, 3, 5, 6, 8, 9, 11, 12, 14, 15, 17, 18, 20, 21, 22 }) |i| {
+        try testing.expect(ts[i] >= '0' and ts[i] <= '9');
+    }
+}
