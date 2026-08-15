@@ -88,7 +88,7 @@ Description=OpenClaw Agent Write Monitor
 After=openclaw-gateway.service
 
 [Service]
-ExecStart=/root/.local/bin/ocwatch /root/.openclaw /root/.openclaw/logs/ocwatch.log
+ExecStart=%h/.local/bin/ocwatch %h/.openclaw %h/.openclaw/logs/ocwatch.log
 Restart=on-failure
 RestartSec=5
 
@@ -100,9 +100,14 @@ WantedBy=default.target
 systemctl --user enable --now ocwatch
 ```
 
-`Restart=on-failure` is load-bearing: ocwatch exits non-zero rather than keep
-running in any state where it would observe nothing, and relies on the
+`%h` expands to the home directory of the user the unit runs as, so the same
+file works whether that is root or anyone else. `Restart=on-failure` is
+load-bearing: ocwatch exits non-zero rather than keep running in any state where
+it would observe nothing or cover the tree only partially, and relies on the
 supervisor to bring it back.
+
+Note the argument defaults compiled into the binary are still `/root`-based, so
+pass both paths explicitly as above rather than relying on them.
 
 ### Rotation
 
@@ -196,12 +201,29 @@ Size is shown for file `WRITE` and `RENAME-TO` events via `statx(2)`.
 Diagnostics share the same shape, in the `<EVENT>` column: `REBUILD`,
 `Q-OVERFLOW` (kernel queue overflowed, events were lost), `NO-DESCEND` (watched
 but not readable, so its subdirectories are not covered), `WATCH-LIMIT`,
-`LINE-OVERFLOW`, and the `*-ERR` tags. They exist so that every way this tool
-can lose sight of something leaves a line behind.
+`DEPTH-LIMIT`, `LINE-OVERFLOW`, and the `*-ERR` tags. They exist so that every
+way this tool can lose sight of something leaves a line behind.
 
-ocwatch exits non-zero rather than continue in a state where it would observe
-nothing: no watchable root, the last watch gone, or the log file failing to
-accept writes.
+The log file is created `0600`, and any log directory it creates `0700` — a
+record of every file an agent touched is a map of the system for whoever can
+read it. The log is opened with `O_NOFOLLOW`, so a symlink in that position
+fails at startup instead of being appended through.
+
+### When it exits
+
+ocwatch exits non-zero rather than continue in any state where it would observe
+less than it claims to:
+
+| Condition | Why it is fatal |
+|-----------|-----------------|
+| No watchable root | Blocks forever on an empty inotify instance, looking healthy |
+| Last watch gone | Same state, reached at runtime |
+| Log writes failing | Watching perfectly and recording nothing |
+| More directories than `MAX_WATCH_DIRS` | Coverage would be partial, and partial lines look complete |
+| Tree deeper than `MAX_DEPTH` | Same, and unbounded recursion would overflow the stack |
+
+The last two are a deliberate trade: a supervisor can act on a dead process,
+but nobody acts on a healthy-looking one that is quietly missing half the tree.
 
 ## License
 

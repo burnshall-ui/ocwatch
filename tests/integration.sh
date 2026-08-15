@@ -230,6 +230,62 @@ expect 'openclaw_keep/kept\.md'       "openclaw's own dot-directories are still 
 
 # ──────────────────────────────────────────────
 echo
+echo "coverage it cannot provide, it refuses to fake:"
+# Partial coverage is the one outcome an audit trail cannot report honestly:
+# the lines it does emit look exactly like complete ones, and nothing in them
+# hints at the part of the tree nobody is watching.
+LOG="$WORK/limit.log"
+mkdir -p "$WORK/limit/watched"
+for i in $(seq 1 600); do mkdir "$WORK/limit/watched/d$i"; done
+rc=0
+timeout 20 "$BIN" "$WORK/limit/watched" "$LOG" >/dev/null 2>&1 || rc=$?
+if [ "$rc" -eq 124 ]; then
+  echo "  FAIL  more directories than the watch limit: hung instead of exiting"
+  fail=1
+elif [ "$rc" -eq 0 ]; then
+  echo "  FAIL  more directories than the watch limit: exited 0, reporting success"
+  fail=1
+else
+  echo "  ok    more directories than the watch limit exits non-zero ($rc)"
+fi
+expect 'COVERAGE-GAP' "the gap is named in the log before exiting"
+
+# The same refusal with a different cause: each recursion frame carries ~12 KB
+# of path and dirent buffers, so an unbounded walk would overflow the stack
+# before it ran out of watches.
+LOG="$WORK/deeplimit.log"
+nested="$WORK/deeplimit/watched"
+mkdir -p "$nested"
+for _ in $(seq 1 70); do nested="$nested/d"; done
+mkdir -p "$nested"
+rc=0
+timeout 20 "$BIN" "$WORK/deeplimit/watched" "$LOG" >/dev/null 2>&1 || rc=$?
+if [ "$rc" -eq 124 ]; then
+  echo "  FAIL  a tree deeper than the recursion limit: hung instead of exiting"
+  fail=1
+elif [ "$rc" -eq 0 ]; then
+  echo "  FAIL  a tree deeper than the recursion limit: exited 0, reporting success"
+  fail=1
+else
+  echo "  ok    a tree deeper than the recursion limit exits non-zero ($rc)"
+fi
+expect 'DEPTH-LIMIT' "the depth cap is named in the log before exiting"
+
+# ──────────────────────────────────────────────
+echo
+echo "the log is not readable by everyone:"
+# It records every file an agent touched, which is a map of the system for
+# anyone who can read it.
+mode=$(stat -c %a "$WORK/basic.log")
+if [ "$mode" = "600" ]; then
+  echo "  ok    the log file is created 0600"
+else
+  echo "  FAIL  the log file is mode $mode, expected 600"
+  fail=1
+fi
+
+# ──────────────────────────────────────────────
+echo
 echo "a watcher that cannot see its root:"
 # With zero watches the process blocks forever on an empty inotify fd. systemd
 # reports it as active(running) and Restart=on-failure never fires, so it is
