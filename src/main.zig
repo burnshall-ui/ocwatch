@@ -21,6 +21,11 @@ const WATCH_MASK: u32 =
 
 const MAX_PATH = 4096;
 const MAX_WATCH_DIRS = 512;
+// Each addWatchRecursive frame carries about 12 KB of path and dirent buffers,
+// and MAX_WATCH_DIRS alone would permit a 512-deep chain — roughly 6 MB of
+// stack, against an 8 MB default that already holds a 2 MB Context. Bounding
+// the depth keeps the worst case comfortably inside it.
+const MAX_DEPTH = 64;
 const EVENT_BUF_LEN = 4096;
 const DENTS_BUF_LEN = 4096;
 
@@ -93,6 +98,9 @@ const Context = struct {
     // A write to the log file failed. Set from deep inside the logging helpers,
     // where there is no way to unwind; the event loop turns it into an exit.
     log_broken: bool = false,
+    // Set when part of the tree cannot be covered — too many directories, or
+    // nested too deeply. Carries the reason so the exit can name it.
+    coverage_gap: ?[]const u8 = null,
 };
 
 pub fn main(io: std.process.Init.Minimal) !void {
@@ -115,10 +123,15 @@ pub fn main(io: std.process.Init.Minimal) !void {
         if (slash > 0) mkdirP(log_path[0..slash]);
     }
 
+    // 0600, not 0644: this is a record of every file an agent touched, which is
+    // a map of the system for anyone who can read it. NOFOLLOW refuses to
+    // append through a symlink — ocwatch usually runs as root, and the log path
+    // is an operator-supplied argument that may point somewhere world-writable.
+    // A deliberate symlink for the log therefore now fails loudly at startup.
     const log_fd_rc = linux.open(
         @ptrCast(&log_path_z),
-        linux.O{ .ACCMODE = .WRONLY, .CREAT = true, .APPEND = true, .CLOEXEC = true },
-        0o644,
+        linux.O{ .ACCMODE = .WRONLY, .CREAT = true, .APPEND = true, .CLOEXEC = true, .NOFOLLOW = true },
+        0o600,
     );
     const log_fd: i32 = switch (linux.errno(log_fd_rc)) {
         .SUCCESS => @intCast(log_fd_rc),
@@ -147,19 +160,9 @@ pub fn main(io: std.process.Init.Minimal) !void {
     defer _ = linux.close(@intCast(ctx.ifd));
 
     // Watch dir and all subdirs
-    try addWatchRecursive(&ctx, watch_dir);
+    try addWatchRecursive(&ctx, watch_dir, 0);
 
-    // A watcher holding no watches blocks forever on an empty inotify fd. The
-    // process stays alive, the supervisor reports `active (running)`, and
-    // nothing is ever observed — broken in the way that is hardest to notice.
-    // Exiting non-zero is the only honest option: it lets Restart= do its job.
-    if (ctx.map.count == 0) {
-        logSimple(&ctx, "NO-WATCH", watch_dir);
-        writeStr(2, "ocwatch: cannot watch anything under ");
-        writeStr(2, watch_dir);
-        writeStr(2, "\n");
-        return error.NoWatchableRoot;
-    }
+    try bailIfBlind(&ctx);
 
     // Startup message
     {
@@ -170,10 +173,7 @@ pub fn main(io: std.process.Init.Minimal) !void {
         }) catch return error.StartupLineFormat;
         writeLine(&ctx, line);
     }
-    if (ctx.log_broken) {
-        writeStr(2, "ocwatch: cannot write the log file\n");
-        return error.LogWriteFailed;
-    }
+    try bailIfBlind(&ctx);
 
     // Event loop
     var buf: [EVENT_BUF_LEN]u8 align(@alignOf(linux.inotify_event)) = undefined;
@@ -208,26 +208,48 @@ pub fn main(io: std.process.Init.Minimal) !void {
             rebuildWatches(&ctx);
         }
 
-        // Keeping watch while the log goes nowhere is the same blindness as
-        // watching nothing at all, only harder to spot.
-        if (ctx.log_broken) {
-            writeStr(2, "ocwatch: log writes are failing; exiting\n");
-            return error.LogWriteFailed;
-        }
-
-        // The last watch is gone — the root was deleted out from under us.
-        // Nothing can ever arrive on this fd again, so staying in the loop
-        // would be the same silent blindness as starting without a root.
-        if (ctx.map.count == 0) {
-            logSimple(&ctx, "WATCH-LOST", "last watch dropped; exiting to be restarted");
-            return error.AllWatchesLost;
-        }
+        try bailIfBlind(&ctx);
     }
 }
 
-fn addWatchRecursive(ctx: *Context, path: []const u8) !void {
+// The conditions under which continuing would mean running without observing —
+// the failure this whole program exists to make impossible elsewhere. Each one
+// leaves a process that a supervisor reports as active(running) while it sees
+// nothing, so each one is an exit rather than a warning: Restart= can act on a
+// dead process, nobody acts on a healthy-looking blind one.
+fn bailIfBlind(ctx: *Context) !void {
+    if (ctx.log_broken) {
+        // Nothing can be written to the log to explain this, by definition.
+        writeStr(2, "ocwatch: log writes are failing; exiting\n");
+        return error.LogWriteFailed;
+    }
+    if (ctx.map.count == 0) {
+        logSimple(ctx, "NO-WATCH", ctx.root);
+        writeStr(2, "ocwatch: nothing left to watch under ");
+        writeStr(2, ctx.root);
+        writeStr(2, "\n");
+        return error.NothingToWatch;
+    }
+    if (ctx.coverage_gap) |why| {
+        // Partial coverage is the one outcome an audit trail cannot report
+        // honestly: the lines it does produce look exactly like complete ones,
+        // and nothing in them hints at the part of the tree nobody is watching.
+        logSimple(ctx, "COVERAGE-GAP", why);
+        writeStr(2, "ocwatch: ");
+        writeStr(2, why);
+        writeStr(2, "; exiting rather than cover the tree partially\n");
+        return error.PartialCoverage;
+    }
+}
+
+fn addWatchRecursive(ctx: *Context, path: []const u8, depth: usize) !void {
     if (path.len >= MAX_PATH) {
         logSimple(ctx, "PATH-TOO-LONG", path);
+        return;
+    }
+    if (depth >= MAX_DEPTH) {
+        logSimple(ctx, "DEPTH-LIMIT", path);
+        ctx.coverage_gap = "tree nested deeper than the recursion limit allows";
         return;
     }
     var path_z: [MAX_PATH]u8 = undefined;
@@ -257,6 +279,7 @@ fn addWatchRecursive(ctx: *Context, path: []const u8) !void {
         .full => {
             logSimple(ctx, "WATCH-LIMIT", path);
             _ = linux.inotify_rm_watch(@intCast(ctx.ifd), wd);
+            ctx.coverage_gap = "more directories than the watch limit allows";
             return;
         },
     }
@@ -329,7 +352,7 @@ fn addWatchRecursive(ctx: *Context, path: []const u8) !void {
                 logSimple(ctx, "PATH-TOO-LONG", path);
                 continue;
             };
-            try addWatchRecursive(ctx, sub_path);
+            try addWatchRecursive(ctx, sub_path, depth + 1);
         }
     }
 }
@@ -360,7 +383,7 @@ fn rebuildWatches(ctx: *Context) void {
     _ = linux.close(@intCast(ctx.ifd));
     ctx.ifd = fresh;
     ctx.map.count = 0;
-    addWatchRecursive(ctx, ctx.root) catch {};
+    addWatchRecursive(ctx, ctx.root, 0) catch {};
 
     var payload: [MAX_PATH + 64]u8 = undefined;
     const p = std.fmt.bufPrint(&payload, "{d} dirs re-scanned under {s}", .{ ctx.map.count, ctx.root }) catch ctx.root;
@@ -422,7 +445,7 @@ fn handleEvent(ctx: *Context, ev: *const linux.inotify_event) void {
                         logSimple(ctx, "PATH-TOO-LONG", parent);
                         return;
                     };
-                    addWatchRecursive(ctx, sub_path) catch {};
+                    addWatchRecursive(ctx, sub_path, 0) catch {};
                 }
             }
         } else if ((ev.mask & (linux.IN.DELETE | linux.IN.DELETE_SELF)) == 0) {
@@ -590,16 +613,18 @@ fn mkdirP(path: []const u8) void {
     buf[path.len] = 0;
 
     // mkdir each '/'-prefix in turn; EEXIST and other errors are ignored — the
-    // subsequent open() of the log file is the real signal.
+    // subsequent open() of the log file is the real signal. 0700 to match the
+    // log itself: a directory anyone can list gives away the log's existence
+    // and its size even when the file cannot be read.
     var i: usize = 1;
     while (i < path.len) : (i += 1) {
         if (path[i] == '/') {
             buf[i] = 0;
-            _ = linux.mkdir(@ptrCast(&buf), 0o755);
+            _ = linux.mkdir(@ptrCast(&buf), 0o700);
             buf[i] = '/';
         }
     }
-    _ = linux.mkdir(@ptrCast(&buf), 0o755);
+    _ = linux.mkdir(@ptrCast(&buf), 0o700);
 }
 
 fn nameFromEvent(ev: *const linux.inotify_event) []const u8 {
