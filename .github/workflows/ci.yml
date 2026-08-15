@@ -1,10 +1,20 @@
 name: CI
 
+# Every push gets built, not just the ones on main: a branch with no CI until
+# somebody opens a pull request is a branch you find out about late. The
+# pull_request trigger stays for contributions from forks, whose pushes do not
+# run here. A branch with an open PR therefore builds twice, which is the price
+# of both — at under a minute a run, an acceptable one.
 on:
   push:
-    branches: ["main", "master"]
   pull_request:
     branches: ["main", "master"]
+
+# Superseded runs are cancelled, except on main where the result of every commit
+# is worth having.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: ${{ github.ref != 'refs/heads/main' }}
 
 env:
   # Keep in sync with minimum_zig_version in build.zig.zon.
