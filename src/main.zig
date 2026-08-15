@@ -16,12 +16,21 @@ const WATCH_MASK: u32 =
     linux.IN.MOVED_FROM | // other side of rename
     linux.IN.CREATE | // new file / dir
     linux.IN.DELETE | // deletion
-    linux.IN.DELETE_SELF; // watched dir removed
+    linux.IN.DELETE_SELF | // watched dir removed
+    linux.IN.MOVE_SELF; // watched dir moved — our cached path is now a lie
 
 const MAX_PATH = 4096;
 const MAX_WATCH_DIRS = 512;
 const EVENT_BUF_LEN = 4096;
 const DENTS_BUF_LEN = 4096;
+
+// A log line has to hold the longest path we are willing to accept, plus the
+// timestamp, the tag and the size suffix. Sizing it below MAX_PATH means long
+// paths fail to format and the event disappears without a trace — see the
+// drift guard at the bottom of this file.
+const MAX_LOG_LINE = MAX_PATH + 128;
+// The startup line names two paths: the watch root and the log file.
+const MAX_START_LINE = 2 * MAX_PATH + 128;
 
 const AddResult = enum { added, duplicate, full };
 
@@ -74,6 +83,16 @@ const Context = struct {
     ifd: i32,
     log_fd: i32,
     map: WdMap,
+    // The tree we were asked to watch. Kept so a rebuild can re-scan it.
+    root: []const u8,
+    // Set by events that invalidate the wd→path map. Acted on once per read
+    // batch rather than inline: rebuilding mid-batch would invalidate the very
+    // descriptors the remaining events in the buffer still refer to, and an
+    // intra-tree rename delivers MOVED_FROM and MOVED_TO together anyway.
+    needs_rebuild: bool = false,
+    // A write to the log file failed. Set from deep inside the logging helpers,
+    // where there is no way to unwind; the event loop turns it into an exit.
+    log_broken: bool = false,
 };
 
 pub fn main(io: std.process.Init.Minimal) !void {
@@ -123,27 +142,43 @@ pub fn main(io: std.process.Init.Minimal) !void {
             return error.InotifyInit;
         },
     };
-    defer _ = linux.close(@intCast(ifd));
-
-    var ctx = Context{ .ifd = ifd, .log_fd = log_fd, .map = .{} };
+    var ctx = Context{ .ifd = ifd, .log_fd = log_fd, .map = .{}, .root = watch_dir };
+    // Deliberately on ctx.ifd, not the local: a rebuild swaps the instance out.
+    defer _ = linux.close(@intCast(ctx.ifd));
 
     // Watch dir and all subdirs
     try addWatchRecursive(&ctx, watch_dir);
 
+    // A watcher holding no watches blocks forever on an empty inotify fd. The
+    // process stays alive, the supervisor reports `active (running)`, and
+    // nothing is ever observed — broken in the way that is hardest to notice.
+    // Exiting non-zero is the only honest option: it lets Restart= do its job.
+    if (ctx.map.count == 0) {
+        logSimple(&ctx, "NO-WATCH", watch_dir);
+        writeStr(2, "ocwatch: cannot watch anything under ");
+        writeStr(2, watch_dir);
+        writeStr(2, "\n");
+        return error.NoWatchableRoot;
+    }
+
     // Startup message
     {
-        var msg: [512]u8 = undefined;
+        var msg: [MAX_START_LINE]u8 = undefined;
         const ts = timestamp();
-        const line = std.fmt.bufPrint(&msg, "{s}  {s:<12}  watching {s} ({d} dirs) → {s}\n", .{
+        const line = std.fmt.bufPrint(&msg, "{s}  {s:<15}  watching {s} ({d} dirs) → {s}\n", .{
             &ts, "START", watch_dir, ctx.map.count, log_path,
         }) catch return error.StartupLineFormat;
         writeLine(&ctx, line);
+    }
+    if (ctx.log_broken) {
+        writeStr(2, "ocwatch: cannot write the log file\n");
+        return error.LogWriteFailed;
     }
 
     // Event loop
     var buf: [EVENT_BUF_LEN]u8 align(@alignOf(linux.inotify_event)) = undefined;
     while (true) {
-        const n = linux.read(@intCast(ifd), &buf, buf.len);
+        const n = linux.read(@intCast(ctx.ifd), &buf, buf.len);
         const nbytes: usize = switch (linux.errno(n)) {
             .SUCCESS => n,
             .INTR => continue,
@@ -162,6 +197,31 @@ pub fn main(io: std.process.Init.Minimal) !void {
             handleEvent(&ctx, ev);
             offset += @sizeOf(linux.inotify_event) + ev.len;
         }
+
+        // Coalesced to once per batch: a single directory rename raises three
+        // separate invalidating events (MOVED_FROM and MOVED_TO at the parent,
+        // MOVE_SELF at the directory itself), and one re-scan settles all of
+        // them. If the root itself was what moved away, the re-scan finds
+        // nothing and the check below turns that into a clean exit.
+        if (ctx.needs_rebuild) {
+            ctx.needs_rebuild = false;
+            rebuildWatches(&ctx);
+        }
+
+        // Keeping watch while the log goes nowhere is the same blindness as
+        // watching nothing at all, only harder to spot.
+        if (ctx.log_broken) {
+            writeStr(2, "ocwatch: log writes are failing; exiting\n");
+            return error.LogWriteFailed;
+        }
+
+        // The last watch is gone — the root was deleted out from under us.
+        // Nothing can ever arrive on this fd again, so staying in the loop
+        // would be the same silent blindness as starting without a root.
+        if (ctx.map.count == 0) {
+            logSimple(&ctx, "WATCH-LOST", "last watch dropped; exiting to be restarted");
+            return error.AllWatchesLost;
+        }
     }
 }
 
@@ -174,12 +234,17 @@ fn addWatchRecursive(ctx: *Context, path: []const u8) !void {
     @memcpy(path_z[0..path.len], path);
     path_z[path.len] = 0;
 
-    const wd_rc = linux.inotify_add_watch(@intCast(ctx.ifd), @ptrCast(&path_z), WATCH_MASK);
+    // ONLYDIR is passed here rather than folded into WATCH_MASK because it is a
+    // flag, not an event: WATCH_MASK is asserted to be exactly the set of bits
+    // eventStr can name. It closes the race where the entry we decided was a
+    // directory has been replaced by a file before we get to watch it.
+    const wd_rc = linux.inotify_add_watch(@intCast(ctx.ifd), @ptrCast(&path_z), WATCH_MASK | linux.IN.ONLYDIR);
     const wd: i32 = switch (linux.errno(wd_rc)) {
         .SUCCESS => @intCast(wd_rc),
-        // Benign: dir vanished mid-walk or we lack search permission on a single
-        // entry. These happen routinely with concurrent agents and don't merit a log line.
-        .NOENT, .ACCES => return,
+        // Benign: dir vanished mid-walk, was replaced by a file, or we lack
+        // search permission on a single entry. These happen routinely with
+        // concurrent agents and don't merit a log line.
+        .NOENT, .ACCES, .NOTDIR => return,
         else => |err| {
             logErr(ctx, "WATCH-ERR", err, path);
             return;
@@ -204,7 +269,17 @@ fn addWatchRecursive(ctx: *Context, path: []const u8) !void {
     );
     const dir_fd: i32 = switch (linux.errno(dir_fd_rc)) {
         .SUCCESS => @intCast(dir_fd_rc),
-        .NOENT, .ACCES => return,
+        // It vanished between the watch and the open; the IGNORED event will
+        // clear the watch we just took.
+        .NOENT, .NOTDIR => return,
+        // We hold a watch on this directory but cannot enumerate it, so its
+        // subdirectories will never be watched. Partial coverage that says so
+        // is defensible; partial coverage in silence is what this tool is for
+        // catching elsewhere.
+        .ACCES => {
+            logSimple(ctx, "NO-DESCEND", path);
+            return;
+        },
         else => |err| {
             logErr(ctx, "OPEN-ERR", err, path);
             return;
@@ -217,7 +292,14 @@ fn addWatchRecursive(ctx: *Context, path: []const u8) !void {
         const nread = linux.getdents64(@intCast(dir_fd), &dents_buf, dents_buf.len);
         switch (linux.errno(nread)) {
             .SUCCESS => {},
-            else => break,
+            .INTR => continue,
+            // Breaking here truncates the scan, so the subdirectories we had
+            // not reached yet stay unwatched. Say so rather than return a
+            // half-built map that looks complete.
+            else => |err| {
+                logErr(ctx, "READDIR-ERR", err, path);
+                break;
+            },
         }
         if (nread == 0) break;
 
@@ -240,16 +322,7 @@ fn addWatchRecursive(ctx: *Context, path: []const u8) !void {
             };
             if (!is_subdir) continue;
 
-            // Skip hidden dirs that aren't openclaw-related
-            if (name.len > 0 and name[0] == '.') {
-                if (!mem.startsWith(u8, name, ".openclaw") and
-                    !mem.eql(u8, name, ".dreams") and
-                    !mem.eql(u8, name, ".clawhub") and
-                    !mem.eql(u8, name, ".openclaw-wiki"))
-                {
-                    continue;
-                }
-            }
+            if (!isWatchableDirName(name)) continue;
 
             var sub: [MAX_PATH]u8 = undefined;
             const sub_path = std.fmt.bufPrint(&sub, "{s}/{s}", .{ path, name }) catch {
@@ -259,6 +332,39 @@ fn addWatchRecursive(ctx: *Context, path: []const u8) !void {
             try addWatchRecursive(ctx, sub_path);
         }
     }
+}
+
+// Drop every watch and re-scan the tree from the root.
+//
+// inotify watches are bound to the inode, not the path, so once a directory
+// moves there is no way to repair the wd→path map in place: the descriptors
+// that need fixing are exactly the ones whose new location we cannot derive.
+// Starting a fresh inotify instance is both simpler and stricter than removing
+// watches one by one — it discards any IGNORED events the teardown would
+// otherwise deliver into the middle of our own event stream.
+//
+// This is also the documented response to a queue overflow: after events are
+// lost, the tree state on record is unknown and only a re-scan restores it.
+fn rebuildWatches(ctx: *Context) void {
+    // Open the replacement before dropping the old one, so a failure here
+    // leaves us degraded but still watching rather than blind.
+    const fresh_rc = linux.inotify_init1(linux.IN.CLOEXEC);
+    const fresh: i32 = switch (linux.errno(fresh_rc)) {
+        .SUCCESS => @intCast(fresh_rc),
+        else => |err| {
+            logErr(ctx, "REBUILD-ERR", err, ctx.root);
+            return;
+        },
+    };
+
+    _ = linux.close(@intCast(ctx.ifd));
+    ctx.ifd = fresh;
+    ctx.map.count = 0;
+    addWatchRecursive(ctx, ctx.root) catch {};
+
+    var payload: [MAX_PATH + 64]u8 = undefined;
+    const p = std.fmt.bufPrint(&payload, "{d} dirs re-scanned under {s}", .{ ctx.map.count, ctx.root }) catch ctx.root;
+    logSimple(ctx, "REBUILD", p);
 }
 
 fn handleEvent(ctx: *Context, ev: *const linux.inotify_event) void {
@@ -272,35 +378,68 @@ fn handleEvent(ctx: *Context, ev: *const linux.inotify_event) void {
 
     // Kernel queue overflowed (fs.inotify.max_queued_events exceeded). Events
     // were lost — log so the gap in the trace is visible to whoever reads it.
+    // Among the lost events there may have been directory creations we never
+    // got to watch, so the map can no longer be trusted either.
     if ((ev.mask & linux.IN.Q_OVERFLOW) != 0) {
         logSimple(ctx, "Q-OVERFLOW", "kernel inotify queue exceeded; events lost");
+        ctx.needs_rebuild = true;
+        return;
+    }
+
+    // This watched directory was moved. The kernel keeps delivering its events
+    // wherever it went — including clean out of our tree — and every path we
+    // hold for it and its children now names the wrong place.
+    if ((ev.mask & linux.IN.MOVE_SELF) != 0) {
+        if (ctx.map.lookup(ev.wd)) |moved| logSimple(ctx, "MOVE-SELF", moved);
+        ctx.needs_rebuild = true;
         return;
     }
 
     const is_dir = (ev.mask & linux.IN.ISDIR) != 0;
 
-    // New directory: start watching it
-    if (is_dir and (ev.mask & linux.IN.CREATE) != 0) {
-        if (ctx.map.lookup(ev.wd)) |parent| {
-            const name = nameFromEvent(ev);
-            if (name.len > 0) {
-                var sub: [MAX_PATH]u8 = undefined;
-                const sub_path = std.fmt.bufPrint(&sub, "{s}/{s}", .{ parent, name }) catch {
-                    logSimple(ctx, "PATH-TOO-LONG", parent);
-                    return;
-                };
-                addWatchRecursive(ctx, sub_path) catch {};
+    if (is_dir) {
+        // The same rule the scan applies, so a directory we would not have
+        // watched does not get watched — or logged — merely because it showed
+        // up at runtime instead of being there at startup.
+        const dir_name = nameFromEvent(ev);
+        if (dir_name.len > 0 and !isWatchableDirName(dir_name)) return;
+
+        if ((ev.mask & (linux.IN.MOVED_TO | linux.IN.MOVED_FROM)) != 0) {
+            // A subtree arrived or left whole. Unlike CREATE this cannot be
+            // handled incrementally: an arriving directory brings its existing
+            // contents with it, and when it came from inside the tree its
+            // watches already exist under their former paths. Re-scan, and let
+            // the move itself fall through to be logged.
+            ctx.needs_rebuild = true;
+        } else if ((ev.mask & linux.IN.CREATE) != 0) {
+            // A newly created directory is empty by definition, so one watch
+            // is enough and a full re-scan would be wasted work.
+            if (ctx.map.lookup(ev.wd)) |parent| {
+                const name = nameFromEvent(ev);
+                if (name.len > 0) {
+                    var sub: [MAX_PATH]u8 = undefined;
+                    const sub_path = std.fmt.bufPrint(&sub, "{s}/{s}", .{ parent, name }) catch {
+                        logSimple(ctx, "PATH-TOO-LONG", parent);
+                        return;
+                    };
+                    addWatchRecursive(ctx, sub_path) catch {};
+                }
             }
+        } else if ((ev.mask & (linux.IN.DELETE | linux.IN.DELETE_SELF)) == 0) {
+            // Anything else about a directory is not worth a line.
+            return;
         }
-        return;
     }
-    // Other dir events: only DELETE / DELETE_SELF are interesting (let them fall through to log).
-    if (is_dir and (ev.mask & (linux.IN.DELETE | linux.IN.DELETE_SELF)) == 0) return;
 
     const is_write = (ev.mask & linux.IN.CLOSE_WRITE) != 0 or (ev.mask & linux.IN.MOVED_TO) != 0;
     const is_delete = (ev.mask & linux.IN.DELETE) != 0 or (ev.mask & linux.IN.DELETE_SELF) != 0;
     const is_move_from = (ev.mask & linux.IN.MOVED_FROM) != 0;
-    if (!is_write and !is_delete and !is_move_from) return;
+    // CREATE is deliberately not logged for files — they are reported on
+    // CLOSE_WRITE instead, and logging both would double every write. A
+    // directory has no CLOSE_WRITE, so without this it would appear in the
+    // trail only once something was written inside it.
+    const is_new_dir = is_dir and (ev.mask & linux.IN.CREATE) != 0;
+    if (!is_write and !is_delete and !is_move_from and !is_new_dir) return;
 
     const dir_path = ctx.map.lookup(ev.wd) orelse return;
     const name = nameFromEvent(ev);
@@ -319,7 +458,9 @@ fn handleEvent(ctx: *Context, ev: *const linux.inotify_event) void {
     // File size for writes (best-effort via statx)
     var extra_buf: [32]u8 = undefined;
     var extra: []const u8 = "";
-    if (is_write and name.len > 0) {
+    // Directories are excluded: statx would happily report the 4096-byte size
+    // of the directory entry itself, which means nothing to a reader.
+    if (is_write and !is_dir and name.len > 0) {
         var path_z: [MAX_PATH]u8 = undefined;
         if (full_path.len < MAX_PATH) {
             @memcpy(path_z[0..full_path.len], full_path);
@@ -338,36 +479,95 @@ fn handleEvent(ctx: *Context, ev: *const linux.inotify_event) void {
         }
     }
 
-    var line_buf: [1200]u8 = undefined;
+    var line_buf: [MAX_LOG_LINE]u8 = undefined;
     const ts = timestamp();
     const line = if (extra.len > 0)
-        std.fmt.bufPrint(&line_buf, "{s}  {s:<12}  {s}  {s}\n", .{ &ts, event_str, full_path, extra }) catch return
+        std.fmt.bufPrint(&line_buf, "{s}  {s:<15}  {s}  {s}\n", .{ &ts, event_str, full_path, extra }) catch {
+            logOverflow(ctx, event_str, full_path);
+            return;
+        }
     else
-        std.fmt.bufPrint(&line_buf, "{s}  {s:<12}  {s}\n", .{ &ts, event_str, full_path }) catch return;
+        std.fmt.bufPrint(&line_buf, "{s}  {s:<15}  {s}\n", .{ &ts, event_str, full_path }) catch {
+            logOverflow(ctx, event_str, full_path);
+            return;
+        };
 
     writeLine(ctx, line);
+}
+
+// write(2) is allowed to accept fewer bytes than it was offered, even for a
+// regular file, and it reports ENOSPC by returning an error nobody was reading.
+// Ignoring both meant a full disk silently discarded the entire product of this
+// process while it went on looking healthy.
+fn writeAll(fd: i32, bytes: []const u8) bool {
+    var written: usize = 0;
+    while (written < bytes.len) {
+        const rc = linux.write(@intCast(fd), bytes.ptr + written, bytes.len - written);
+        switch (linux.errno(rc)) {
+            .SUCCESS => {
+                if (rc == 0) return false; // no progress — refuse to spin on it
+                written += rc;
+            },
+            .INTR => continue,
+            else => return false,
+        }
+    }
+    return true;
 }
 
 fn writeLine(ctx: *Context, line: []const u8) void {
-    _ = linux.write(@intCast(ctx.log_fd), line.ptr, line.len);
-    _ = linux.write(1, line.ptr, line.len); // stdout
+    // The log file is the whole point of the process, so a failure there is
+    // fatal — recorded here and acted on by the event loop, since this is
+    // called from too deep to unwind cleanly.
+    if (!writeAll(ctx.log_fd, line)) ctx.log_broken = true;
+    // stdout is a convenience for running it by hand or under journald, and a
+    // closed pipe there is not a reason to bring the watcher down.
+    _ = writeAll(1, line);
 }
 
 fn logSimple(ctx: *Context, tag: []const u8, payload: []const u8) void {
-    var buf: [MAX_PATH + 64]u8 = undefined;
+    var buf: [MAX_LOG_LINE]u8 = undefined;
     const ts = timestamp();
-    const line = std.fmt.bufPrint(&buf, "{s}  {s:<12}  {s}\n", .{ &ts, tag, payload }) catch return;
+    const line = std.fmt.bufPrint(&buf, "{s}  {s:<15}  {s}\n", .{ &ts, tag, payload }) catch return;
     writeLine(ctx, line);
 }
 
+// MAX_LOG_LINE is sized so this cannot trigger for any path the kernel can
+// hand us. It exists because the previous code answered an unformattable line
+// with a bare `catch return`, which is how writes below deep paths went
+// missing with nothing in the log to suggest anything had been lost. An event
+// we cannot render in full is still an event worth admitting to.
+fn logOverflow(ctx: *Context, event_str: []const u8, path: []const u8) void {
+    var payload: [320]u8 = undefined;
+    const head = path[0..@min(path.len, 200)];
+    const p = std.fmt.bufPrint(&payload, "{s} ({d} bytes, truncated): {s}", .{ event_str, path.len, head }) catch return;
+    logSimple(ctx, "LINE-OVERFLOW", p);
+}
+
 fn writeStr(fd: i32, s: []const u8) void {
-    _ = linux.write(@intCast(fd), s.ptr, s.len);
+    _ = writeAll(fd, s);
 }
 
 fn logErr(ctx: *Context, tag: []const u8, err: linux.E, path: []const u8) void {
-    var buf: [MAX_PATH + 64]u8 = undefined;
+    var buf: [MAX_LOG_LINE]u8 = undefined;
     const payload = std.fmt.bufPrint(&buf, "{s}: {s}", .{ @tagName(err), path }) catch path;
     logSimple(ctx, tag, payload);
+}
+
+// Hidden directories are skipped unless they are openclaw's own — a single
+// .git in the tree would bury the trail under object churn.
+//
+// This lives in one place because it used to be applied only while scanning,
+// which made the rule depend on *when* a directory appeared: one that already
+// existed at startup was skipped, while the identical directory created a
+// second later was watched. Note the root itself is never filtered; it is named
+// explicitly on the command line, and it is usually ~/.openclaw.
+fn isWatchableDirName(name: []const u8) bool {
+    if (name.len == 0 or name[0] != '.') return true;
+    return mem.startsWith(u8, name, ".openclaw") or
+        mem.eql(u8, name, ".dreams") or
+        mem.eql(u8, name, ".clawhub") or
+        mem.eql(u8, name, ".openclaw-wiki");
 }
 
 fn isDirAt(dir_fd: i32, name: [*:0]const u8) bool {
@@ -410,19 +610,23 @@ fn nameFromEvent(ev: *const linux.inotify_event) []const u8 {
 }
 
 fn eventStr(mask: u32) []const u8 {
+    const isdir = mask & linux.IN.ISDIR != 0;
     if (mask & linux.IN.CLOSE_WRITE != 0) return "WRITE";
-    if (mask & linux.IN.MOVED_TO != 0) return "RENAME-TO";
-    if (mask & linux.IN.MOVED_FROM != 0) return "RENAME-FROM";
+    if (mask & linux.IN.MOVED_TO != 0) return if (isdir) "RENAME-TO-DIR" else "RENAME-TO";
+    if (mask & linux.IN.MOVED_FROM != 0) return if (isdir) "RENAME-FROM-DIR" else "RENAME-FROM";
+    if (mask & linux.IN.MOVE_SELF != 0) return "MOVE-SELF";
     if (mask & linux.IN.DELETE_SELF != 0) return "DELETE-SELF";
-    if (mask & linux.IN.DELETE != 0) {
-        return if (mask & linux.IN.ISDIR != 0) "DELETE-DIR" else "DELETE";
-    }
-    if (mask & linux.IN.CREATE != 0) return "CREATE";
+    if (mask & linux.IN.DELETE != 0) return if (isdir) "DELETE-DIR" else "DELETE";
+    if (mask & linux.IN.CREATE != 0) return if (isdir) "CREATE-DIR" else "CREATE";
     return "UNKNOWN";
 }
 
-fn timestamp() [23]u8 {
-    var buf: [23]u8 = [_]u8{' '} ** 23;
+// UTC, and says so. The conversion below applies no timezone, so the output
+// was always UTC — it just looked like local time, which on a box running
+// anything other than UTC silently shifts every line against journalctl and
+// every other log you would correlate it with.
+fn timestamp() [24]u8 {
+    var buf: [24]u8 = [_]u8{' '} ** 24;
     var ts: linux.timespec = undefined;
     _ = linux.clock_gettime(linux.CLOCK.REALTIME, &ts);
 
@@ -435,7 +639,7 @@ fn timestamp() [23]u8 {
     const ds = es.getDaySeconds();
     const yd = day.calculateYearDay();
     const md = yd.calculateMonthDay();
-    _ = std.fmt.bufPrint(&buf, "{d:0>4}-{d:0>2}-{d:0>2}T{d:0>2}:{d:0>2}:{d:0>2}.{d:0>3}", .{
+    _ = std.fmt.bufPrint(&buf, "{d:0>4}-{d:0>2}-{d:0>2}T{d:0>2}:{d:0>2}:{d:0>2}.{d:0>3}Z", .{
         yd.year,
         md.month.numeric(),
         md.day_index + 1,
@@ -465,11 +669,24 @@ test "eventStr names every mask we subscribe to" {
     try testing.expectEqualStrings("CREATE", eventStr(linux.IN.CREATE));
 }
 
-test "eventStr separates directory deletions from file deletions" {
+test "eventStr separates directory events from file events" {
     try testing.expectEqualStrings("DELETE-DIR", eventStr(linux.IN.DELETE | linux.IN.ISDIR));
     try testing.expectEqualStrings("DELETE", eventStr(linux.IN.DELETE));
-    // ISDIR on its own is not a deletion.
-    try testing.expectEqualStrings("CREATE", eventStr(linux.IN.CREATE | linux.IN.ISDIR));
+    try testing.expectEqualStrings("CREATE-DIR", eventStr(linux.IN.CREATE | linux.IN.ISDIR));
+    try testing.expectEqualStrings("CREATE", eventStr(linux.IN.CREATE));
+    // Directory moves are the events that force a rebuild, so a reader has to
+    // be able to tell them apart from an ordinary file rename at a glance.
+    try testing.expectEqualStrings("RENAME-TO-DIR", eventStr(linux.IN.MOVED_TO | linux.IN.ISDIR));
+    try testing.expectEqualStrings("RENAME-TO", eventStr(linux.IN.MOVED_TO));
+    try testing.expectEqualStrings("RENAME-FROM-DIR", eventStr(linux.IN.MOVED_FROM | linux.IN.ISDIR));
+    try testing.expectEqualStrings("RENAME-FROM", eventStr(linux.IN.MOVED_FROM));
+}
+
+test "eventStr names a watched directory moving out from under us" {
+    // The kernel does not set ISDIR on MOVE_SELF, the same way it does not for
+    // DELETE_SELF — the subject of the event is the watch itself.
+    try testing.expectEqualStrings("MOVE-SELF", eventStr(linux.IN.MOVE_SELF));
+    try testing.expectEqualStrings("DELETE-SELF", eventStr(linux.IN.DELETE_SELF));
 }
 
 test "eventStr prefers the write over co-occurring bits" {
@@ -495,6 +712,7 @@ test "WATCH_MASK subscribes to exactly the events eventStr can name" {
         linux.IN.CREATE,
         linux.IN.DELETE,
         linux.IN.DELETE_SELF,
+        linux.IN.MOVE_SELF,
     };
     var covered: u32 = 0;
     for (named) |bit| {
@@ -504,10 +722,29 @@ test "WATCH_MASK subscribes to exactly the events eventStr can name" {
     try testing.expectEqual(WATCH_MASK, covered);
 }
 
+test "the log line buffer can hold the longest event we accept" {
+    // Drift guard: a line is timestamp + separator + padded tag + separator +
+    // path + separator + size suffix + newline. Shrinking MAX_LOG_LINE below
+    // that — or raising MAX_PATH without it — brings back the silent drop of
+    // events whose path is longer than the buffer.
+    const longest_tag = "RENAME-FROM-DIR".len;
+    const size_suffix = "[18446744073709551615B]".len;
+    const stamp = @typeInfo(@TypeOf(timestamp())).array.len;
+    const worst_case = stamp + 2 + longest_tag + 2 + MAX_PATH + 2 + size_suffix + 1;
+    try testing.expect(MAX_LOG_LINE >= worst_case);
+
+    // The tag column is padded to this width. A longer tag does not truncate,
+    // it shoves the path column out of alignment for that one line.
+    try testing.expect(longest_tag <= 15);
+
+    // The startup line carries the watch root and the log path together.
+    try testing.expect(MAX_START_LINE >= stamp + 2 + longest_tag + 2 + 2 * MAX_PATH + 64);
+}
+
 test "timestamp has the fixed width the log format relies on" {
     const ts = timestamp();
-    try testing.expectEqual(@as(usize, 23), ts.len);
-    // YYYY-MM-DDTHH:MM:SS.mmm
+    try testing.expectEqual(@as(usize, 24), ts.len);
+    // YYYY-MM-DDTHH:MM:SS.mmmZ
     try testing.expectEqual(@as(u8, '-'), ts[4]);
     try testing.expectEqual(@as(u8, '-'), ts[7]);
     try testing.expectEqual(@as(u8, 'T'), ts[10]);
@@ -517,4 +754,7 @@ test "timestamp has the fixed width the log format relies on" {
     for ([_]usize{ 0, 1, 2, 3, 5, 6, 8, 9, 11, 12, 14, 15, 17, 18, 20, 21, 22 }) |i| {
         try testing.expect(ts[i] >= '0' and ts[i] <= '9');
     }
+    // The zone marker is the point: the value was always UTC, but a reader
+    // correlating this against journalctl had no way to know that.
+    try testing.expectEqual(@as(u8, 'Z'), ts[23]);
 }

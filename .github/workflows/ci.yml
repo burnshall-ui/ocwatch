@@ -1,10 +1,20 @@
 name: CI
 
+# Every push gets built, not just the ones on main: a branch with no CI until
+# somebody opens a pull request is a branch you find out about late. The
+# pull_request trigger stays for contributions from forks, whose pushes do not
+# run here. A branch with an open PR therefore builds twice, which is the price
+# of both — at under a minute a run, an acceptable one.
 on:
   push:
-    branches: ["main", "master"]
   pull_request:
     branches: ["main", "master"]
+
+# Superseded runs are cancelled, except on main where the result of every commit
+# is worth having.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: ${{ github.ref != 'refs/heads/main' }}
 
 env:
   # Keep in sync with minimum_zig_version in build.zig.zon.
@@ -13,7 +23,19 @@ env:
 jobs:
   build-and-test:
     # ocwatch is Linux-only by design: inotify, getdents64, statx.
-    runs-on: ubuntu-latest
+    #
+    # Both architectures run the whole suite rather than cross-compiling for
+    # aarch64 and calling it covered. Most of what can break here — the wd map,
+    # rebuilds after a directory move, the exit paths — only shows up against a
+    # live kernel, and aarch64 is the architecture this is deployed on. A build
+    # that merely links for the target would never exercise any of it.
+    runs-on: ${{ matrix.runner }}
+    strategy:
+      # One architecture failing must not cancel the other: which of the two
+      # broke is the most useful thing to know.
+      fail-fast: false
+      matrix:
+        runner: [ubuntu-latest, ubuntu-24.04-arm]
 
     steps:
       - name: Checkout
@@ -23,6 +45,12 @@ jobs:
         uses: mlugg/setup-zig@v2
         with:
           version: ${{ env.ZIG_VERSION }}
+
+      - name: Report toolchain and architecture
+        run: |
+          uname -m
+          zig version
+          zig targets | head -1 >/dev/null   # fail early if the toolchain is unusable
 
       - name: Check formatting
         run: zig fmt --check .
@@ -34,7 +62,8 @@ jobs:
         run: zig build test --summary all
 
       # Exercises the parts that only exist against a live kernel: recursive
-      # watch setup, both halves of an atomic rename, and watches added for
-      # directories created after startup.
+      # watch setup, both halves of an atomic rename, watches added for
+      # directories created after startup, the rebuild that follows a directory
+      # move, and the exit paths taken when there is nothing left to watch.
       - name: Integration test
         run: ./tests/integration.sh

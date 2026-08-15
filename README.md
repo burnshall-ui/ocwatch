@@ -100,25 +100,108 @@ WantedBy=default.target
 systemctl --user enable --now ocwatch
 ```
 
+`Restart=on-failure` is load-bearing: ocwatch exits non-zero rather than keep
+running in any state where it would observe nothing, and relies on the
+supervisor to bring it back.
+
+### Rotation
+
+ocwatch does not rotate its own log — that is logrotate's job — but it does
+constrain how: it holds one `O_APPEND` descriptor for the life of the process
+and cannot be told to reopen it, so the file has to be rotated in place.
+
+```
+# /etc/logrotate.d/ocwatch
+/root/.openclaw/logs/ocwatch.log {
+    weekly
+    maxsize 20M
+    rotate 8
+    compress
+    notifempty
+    missingok
+    copytruncate
+}
+```
+
+`copytruncate` is the part that matters. Rotating by rename would leave ocwatch
+writing into an unlinked inode: the new log stays empty and the trail stops
+without a word. `O_APPEND` is what makes the truncate safe — writes re-seek to
+the end, so the file resumes at offset 0 instead of returning as a sparse hole
+the size of the old log. The cost is a small window: anything written between
+the copy and the truncate is lost.
+
+For scale, a monitored `~/.openclaw` produced about 77 KB/day over 120 days,
+compressing to roughly a tenth. Eight weekly generations is a couple of months
+of history in a few megabytes.
+
 ## Event types
 
-| Event         | Meaning                                           |
-|---------------|---------------------------------------------------|
-| `WRITE`       | File closed after write (`IN_CLOSE_WRITE`)        |
-| `RENAME-TO`   | File renamed here — openclaw's atomic write pattern |
-| `RENAME-FROM` | Source side of a rename                           |
-| `DELETE`      | File removed                                      |
-| `DELETE-SELF` | Watched directory removed                         |
+| Event             | Meaning                                             |
+|-------------------|-----------------------------------------------------|
+| `WRITE`           | File closed after write (`IN_CLOSE_WRITE`)          |
+| `RENAME-TO`       | File renamed here — openclaw's atomic write pattern |
+| `RENAME-FROM`     | Source side of a rename                             |
+| `DELETE`          | File removed                                        |
+| `CREATE-DIR`      | Directory created                                   |
+| `DELETE-DIR`      | Directory removed                                   |
+| `RENAME-TO-DIR`   | Directory moved into the tree                       |
+| `RENAME-FROM-DIR` | Directory moved out of, or within, the tree         |
+| `MOVE-SELF`       | A watched directory was itself moved                |
+| `DELETE-SELF`     | Watched directory removed                           |
 
-New subdirectories are picked up automatically at runtime — no restart needed.
+Files are reported on `WRITE`, not on creation, so a new file produces one line
+rather than two. Directories have no `CLOSE_WRITE`, so they are reported when
+they appear.
+
+### Keeping up with a moving tree
+
+inotify is not recursive, and its watches follow the inode rather than the
+path. A directory that is moved therefore keeps its watch but not its meaning:
+left alone, the watcher would report writes under a path that no longer exists,
+and would go on reporting a directory that has been moved clean out of the
+tree. Neither shows up as a gap in the log — it reports fiction instead.
+
+So anything that invalidates the path map — a directory moved in, out or
+renamed, or a kernel queue overflow that may have hidden a directory's creation
+— triggers a full re-scan from the root, logged as `REBUILD`. Re-scans are
+coalesced to one per batch of events, since a single rename raises three.
+
+Directories created outright are cheaper: they are empty by definition, so they
+just get a watch, no re-scan.
+
+If a re-scan finds nothing to watch — the root was deleted or moved away —
+ocwatch logs the reason and exits non-zero rather than block forever on an
+empty inotify instance, so `Restart=` can act on it.
+
+### What is not watched
+
+Hidden directories are skipped unless they are openclaw's own (`.openclaw*`,
+`.dreams`, `.clawhub`, `.openclaw-wiki`) — a `.git` in the tree would bury the
+trail under object churn. The rule is about what a directory is, not when it
+turned up: a filtered directory created while ocwatch is running is skipped
+exactly like one that was already there. The watch root itself is never
+filtered, since it is named explicitly and is usually `~/.openclaw`.
 
 ## Log format
 
 ```
-<ISO8601-ms>  <EVENT>       <full-path>  [<size>B]
+<ISO8601-ms-UTC>  <EVENT>          <full-path>  [<size>B]
 ```
 
-Size is shown for `WRITE` and `RENAME-TO` events via `statx(2)`.
+Timestamps are UTC and say so with a trailing `Z`, so they line up with
+`journalctl --utc` rather than looking like local time.
+
+Size is shown for file `WRITE` and `RENAME-TO` events via `statx(2)`.
+
+Diagnostics share the same shape, in the `<EVENT>` column: `REBUILD`,
+`Q-OVERFLOW` (kernel queue overflowed, events were lost), `NO-DESCEND` (watched
+but not readable, so its subdirectories are not covered), `WATCH-LIMIT`,
+`LINE-OVERFLOW`, and the `*-ERR` tags. They exist so that every way this tool
+can lose sight of something leaves a line behind.
+
+ocwatch exits non-zero rather than continue in a state where it would observe
+nothing: no watchable root, the last watch gone, or the log file failing to
+accept writes.
 
 ## License
 
