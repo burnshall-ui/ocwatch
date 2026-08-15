@@ -90,6 +90,9 @@ const Context = struct {
     // descriptors the remaining events in the buffer still refer to, and an
     // intra-tree rename delivers MOVED_FROM and MOVED_TO together anyway.
     needs_rebuild: bool = false,
+    // A write to the log file failed. Set from deep inside the logging helpers,
+    // where there is no way to unwind; the event loop turns it into an exit.
+    log_broken: bool = false,
 };
 
 pub fn main(io: std.process.Init.Minimal) !void {
@@ -167,6 +170,10 @@ pub fn main(io: std.process.Init.Minimal) !void {
         }) catch return error.StartupLineFormat;
         writeLine(&ctx, line);
     }
+    if (ctx.log_broken) {
+        writeStr(2, "ocwatch: cannot write the log file\n");
+        return error.LogWriteFailed;
+    }
 
     // Event loop
     var buf: [EVENT_BUF_LEN]u8 align(@alignOf(linux.inotify_event)) = undefined;
@@ -201,6 +208,13 @@ pub fn main(io: std.process.Init.Minimal) !void {
             rebuildWatches(&ctx);
         }
 
+        // Keeping watch while the log goes nowhere is the same blindness as
+        // watching nothing at all, only harder to spot.
+        if (ctx.log_broken) {
+            writeStr(2, "ocwatch: log writes are failing; exiting\n");
+            return error.LogWriteFailed;
+        }
+
         // The last watch is gone — the root was deleted out from under us.
         // Nothing can ever arrive on this fd again, so staying in the loop
         // would be the same silent blindness as starting without a root.
@@ -220,12 +234,17 @@ fn addWatchRecursive(ctx: *Context, path: []const u8) !void {
     @memcpy(path_z[0..path.len], path);
     path_z[path.len] = 0;
 
-    const wd_rc = linux.inotify_add_watch(@intCast(ctx.ifd), @ptrCast(&path_z), WATCH_MASK);
+    // ONLYDIR is passed here rather than folded into WATCH_MASK because it is a
+    // flag, not an event: WATCH_MASK is asserted to be exactly the set of bits
+    // eventStr can name. It closes the race where the entry we decided was a
+    // directory has been replaced by a file before we get to watch it.
+    const wd_rc = linux.inotify_add_watch(@intCast(ctx.ifd), @ptrCast(&path_z), WATCH_MASK | linux.IN.ONLYDIR);
     const wd: i32 = switch (linux.errno(wd_rc)) {
         .SUCCESS => @intCast(wd_rc),
-        // Benign: dir vanished mid-walk or we lack search permission on a single
-        // entry. These happen routinely with concurrent agents and don't merit a log line.
-        .NOENT, .ACCES => return,
+        // Benign: dir vanished mid-walk, was replaced by a file, or we lack
+        // search permission on a single entry. These happen routinely with
+        // concurrent agents and don't merit a log line.
+        .NOENT, .ACCES, .NOTDIR => return,
         else => |err| {
             logErr(ctx, "WATCH-ERR", err, path);
             return;
@@ -250,7 +269,17 @@ fn addWatchRecursive(ctx: *Context, path: []const u8) !void {
     );
     const dir_fd: i32 = switch (linux.errno(dir_fd_rc)) {
         .SUCCESS => @intCast(dir_fd_rc),
-        .NOENT, .ACCES => return,
+        // It vanished between the watch and the open; the IGNORED event will
+        // clear the watch we just took.
+        .NOENT, .NOTDIR => return,
+        // We hold a watch on this directory but cannot enumerate it, so its
+        // subdirectories will never be watched. Partial coverage that says so
+        // is defensible; partial coverage in silence is what this tool is for
+        // catching elsewhere.
+        .ACCES => {
+            logSimple(ctx, "NO-DESCEND", path);
+            return;
+        },
         else => |err| {
             logErr(ctx, "OPEN-ERR", err, path);
             return;
@@ -263,7 +292,14 @@ fn addWatchRecursive(ctx: *Context, path: []const u8) !void {
         const nread = linux.getdents64(@intCast(dir_fd), &dents_buf, dents_buf.len);
         switch (linux.errno(nread)) {
             .SUCCESS => {},
-            else => break,
+            .INTR => continue,
+            // Breaking here truncates the scan, so the subdirectories we had
+            // not reached yet stay unwatched. Say so rather than return a
+            // half-built map that looks complete.
+            else => |err| {
+                logErr(ctx, "READDIR-ERR", err, path);
+                break;
+            },
         }
         if (nread == 0) break;
 
@@ -286,16 +322,7 @@ fn addWatchRecursive(ctx: *Context, path: []const u8) !void {
             };
             if (!is_subdir) continue;
 
-            // Skip hidden dirs that aren't openclaw-related
-            if (name.len > 0 and name[0] == '.') {
-                if (!mem.startsWith(u8, name, ".openclaw") and
-                    !mem.eql(u8, name, ".dreams") and
-                    !mem.eql(u8, name, ".clawhub") and
-                    !mem.eql(u8, name, ".openclaw-wiki"))
-                {
-                    continue;
-                }
-            }
+            if (!isWatchableDirName(name)) continue;
 
             var sub: [MAX_PATH]u8 = undefined;
             const sub_path = std.fmt.bufPrint(&sub, "{s}/{s}", .{ path, name }) catch {
@@ -371,6 +398,12 @@ fn handleEvent(ctx: *Context, ev: *const linux.inotify_event) void {
     const is_dir = (ev.mask & linux.IN.ISDIR) != 0;
 
     if (is_dir) {
+        // The same rule the scan applies, so a directory we would not have
+        // watched does not get watched — or logged — merely because it showed
+        // up at runtime instead of being there at startup.
+        const dir_name = nameFromEvent(ev);
+        if (dir_name.len > 0 and !isWatchableDirName(dir_name)) return;
+
         if ((ev.mask & (linux.IN.MOVED_TO | linux.IN.MOVED_FROM)) != 0) {
             // A subtree arrived or left whole. Unlike CREATE this cannot be
             // handled incrementally: an arriving directory brings its existing
@@ -462,9 +495,34 @@ fn handleEvent(ctx: *Context, ev: *const linux.inotify_event) void {
     writeLine(ctx, line);
 }
 
+// write(2) is allowed to accept fewer bytes than it was offered, even for a
+// regular file, and it reports ENOSPC by returning an error nobody was reading.
+// Ignoring both meant a full disk silently discarded the entire product of this
+// process while it went on looking healthy.
+fn writeAll(fd: i32, bytes: []const u8) bool {
+    var written: usize = 0;
+    while (written < bytes.len) {
+        const rc = linux.write(@intCast(fd), bytes.ptr + written, bytes.len - written);
+        switch (linux.errno(rc)) {
+            .SUCCESS => {
+                if (rc == 0) return false; // no progress — refuse to spin on it
+                written += rc;
+            },
+            .INTR => continue,
+            else => return false,
+        }
+    }
+    return true;
+}
+
 fn writeLine(ctx: *Context, line: []const u8) void {
-    _ = linux.write(@intCast(ctx.log_fd), line.ptr, line.len);
-    _ = linux.write(1, line.ptr, line.len); // stdout
+    // The log file is the whole point of the process, so a failure there is
+    // fatal — recorded here and acted on by the event loop, since this is
+    // called from too deep to unwind cleanly.
+    if (!writeAll(ctx.log_fd, line)) ctx.log_broken = true;
+    // stdout is a convenience for running it by hand or under journald, and a
+    // closed pipe there is not a reason to bring the watcher down.
+    _ = writeAll(1, line);
 }
 
 fn logSimple(ctx: *Context, tag: []const u8, payload: []const u8) void {
@@ -487,13 +545,29 @@ fn logOverflow(ctx: *Context, event_str: []const u8, path: []const u8) void {
 }
 
 fn writeStr(fd: i32, s: []const u8) void {
-    _ = linux.write(@intCast(fd), s.ptr, s.len);
+    _ = writeAll(fd, s);
 }
 
 fn logErr(ctx: *Context, tag: []const u8, err: linux.E, path: []const u8) void {
     var buf: [MAX_LOG_LINE]u8 = undefined;
     const payload = std.fmt.bufPrint(&buf, "{s}: {s}", .{ @tagName(err), path }) catch path;
     logSimple(ctx, tag, payload);
+}
+
+// Hidden directories are skipped unless they are openclaw's own — a single
+// .git in the tree would bury the trail under object churn.
+//
+// This lives in one place because it used to be applied only while scanning,
+// which made the rule depend on *when* a directory appeared: one that already
+// existed at startup was skipped, while the identical directory created a
+// second later was watched. Note the root itself is never filtered; it is named
+// explicitly on the command line, and it is usually ~/.openclaw.
+fn isWatchableDirName(name: []const u8) bool {
+    if (name.len == 0 or name[0] != '.') return true;
+    return mem.startsWith(u8, name, ".openclaw") or
+        mem.eql(u8, name, ".dreams") or
+        mem.eql(u8, name, ".clawhub") or
+        mem.eql(u8, name, ".openclaw-wiki");
 }
 
 fn isDirAt(dir_fd: i32, name: [*:0]const u8) bool {
@@ -547,8 +621,12 @@ fn eventStr(mask: u32) []const u8 {
     return "UNKNOWN";
 }
 
-fn timestamp() [23]u8 {
-    var buf: [23]u8 = [_]u8{' '} ** 23;
+// UTC, and says so. The conversion below applies no timezone, so the output
+// was always UTC — it just looked like local time, which on a box running
+// anything other than UTC silently shifts every line against journalctl and
+// every other log you would correlate it with.
+fn timestamp() [24]u8 {
+    var buf: [24]u8 = [_]u8{' '} ** 24;
     var ts: linux.timespec = undefined;
     _ = linux.clock_gettime(linux.CLOCK.REALTIME, &ts);
 
@@ -561,7 +639,7 @@ fn timestamp() [23]u8 {
     const ds = es.getDaySeconds();
     const yd = day.calculateYearDay();
     const md = yd.calculateMonthDay();
-    _ = std.fmt.bufPrint(&buf, "{d:0>4}-{d:0>2}-{d:0>2}T{d:0>2}:{d:0>2}:{d:0>2}.{d:0>3}", .{
+    _ = std.fmt.bufPrint(&buf, "{d:0>4}-{d:0>2}-{d:0>2}T{d:0>2}:{d:0>2}:{d:0>2}.{d:0>3}Z", .{
         yd.year,
         md.month.numeric(),
         md.day_index + 1,
@@ -651,7 +729,8 @@ test "the log line buffer can hold the longest event we accept" {
     // events whose path is longer than the buffer.
     const longest_tag = "RENAME-FROM-DIR".len;
     const size_suffix = "[18446744073709551615B]".len;
-    const worst_case = 23 + 2 + longest_tag + 2 + MAX_PATH + 2 + size_suffix + 1;
+    const stamp = @typeInfo(@TypeOf(timestamp())).array.len;
+    const worst_case = stamp + 2 + longest_tag + 2 + MAX_PATH + 2 + size_suffix + 1;
     try testing.expect(MAX_LOG_LINE >= worst_case);
 
     // The tag column is padded to this width. A longer tag does not truncate,
@@ -659,13 +738,13 @@ test "the log line buffer can hold the longest event we accept" {
     try testing.expect(longest_tag <= 15);
 
     // The startup line carries the watch root and the log path together.
-    try testing.expect(MAX_START_LINE >= 23 + 2 + longest_tag + 2 + 2 * MAX_PATH + 64);
+    try testing.expect(MAX_START_LINE >= stamp + 2 + longest_tag + 2 + 2 * MAX_PATH + 64);
 }
 
 test "timestamp has the fixed width the log format relies on" {
     const ts = timestamp();
-    try testing.expectEqual(@as(usize, 23), ts.len);
-    // YYYY-MM-DDTHH:MM:SS.mmm
+    try testing.expectEqual(@as(usize, 24), ts.len);
+    // YYYY-MM-DDTHH:MM:SS.mmmZ
     try testing.expectEqual(@as(u8, '-'), ts[4]);
     try testing.expectEqual(@as(u8, '-'), ts[7]);
     try testing.expectEqual(@as(u8, 'T'), ts[10]);
@@ -675,4 +754,7 @@ test "timestamp has the fixed width the log format relies on" {
     for ([_]usize{ 0, 1, 2, 3, 5, 6, 8, 9, 11, 12, 14, 15, 17, 18, 20, 21, 22 }) |i| {
         try testing.expect(ts[i] >= '0' and ts[i] <= '9');
     }
+    // The zone marker is the point: the value was always UTC, but a reader
+    // correlating this against journalctl had no way to know that.
+    try testing.expectEqual(@as(u8, 'Z'), ts[23]);
 }

@@ -105,11 +105,12 @@ else
   fail=1
 fi
 
-# Timestamps must stay parseable — the log is meant to be grepped and sorted.
-if grep -qE '^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}\.[0-9]{3}  ' "$LOG"; then
-  echo "  ok    timestamp format"
+# Timestamps must stay parseable — the log is meant to be grepped and sorted —
+# and must carry the zone, since the value is UTC on a box that usually is not.
+if grep -qE '^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}\.[0-9]{3}Z  ' "$LOG"; then
+  echo "  ok    timestamp format is ISO8601 UTC"
 else
-  echo "  FAIL  timestamp format"
+  echo "  FAIL  timestamp format is ISO8601 UTC"
   fail=1
 fi
 
@@ -203,6 +204,29 @@ stop_watcher
 
 expect 'WRITE .*/shallow\.md'   "control: a short path in the same run is logged ($deep_len-char sibling)"
 expect 'WRITE .*/deep\.md'      "a path longer than the line buffer is not silently dropped"
+
+# ──────────────────────────────────────────────
+echo
+echo "the hidden-directory filter:"
+# The filter used to be applied only while scanning, which made it depend on
+# when a directory appeared rather than on what it is: a .git already present
+# at startup was skipped, while the identical directory created a second later
+# was watched and logged.
+LOG="$WORK/hidden.log"
+mkdir -p "$WORK/hidden/watched/.git_pre" "$WORK/hidden/watched/.openclaw_keep"
+start_watcher "$WORK/hidden/watched" "$LOG"
+
+echo "x" > "$WORK/hidden/watched/.git_pre/present.md"
+mkdir "$WORK/hidden/watched/.git_post"
+sleep 0.3
+echo "x" > "$WORK/hidden/watched/.git_post/late.md"
+echo "x" > "$WORK/hidden/watched/.openclaw_keep/kept.md"
+sleep 0.5
+stop_watcher
+
+expect_absent 'git_pre/present\.md'   "a filtered directory present at startup stays unwatched"
+expect_absent 'git_post'              "the same directory created at runtime is filtered identically"
+expect 'openclaw_keep/kept\.md'       "openclaw's own dot-directories are still watched"
 
 # ──────────────────────────────────────────────
 echo

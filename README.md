@@ -139,13 +139,35 @@ If a re-scan finds nothing to watch — the root was deleted or moved away —
 ocwatch logs the reason and exits non-zero rather than block forever on an
 empty inotify instance, so `Restart=` can act on it.
 
+### What is not watched
+
+Hidden directories are skipped unless they are openclaw's own (`.openclaw*`,
+`.dreams`, `.clawhub`, `.openclaw-wiki`) — a `.git` in the tree would bury the
+trail under object churn. The rule is about what a directory is, not when it
+turned up: a filtered directory created while ocwatch is running is skipped
+exactly like one that was already there. The watch root itself is never
+filtered, since it is named explicitly and is usually `~/.openclaw`.
+
 ## Log format
 
 ```
-<ISO8601-ms>  <EVENT>          <full-path>  [<size>B]
+<ISO8601-ms-UTC>  <EVENT>          <full-path>  [<size>B]
 ```
 
+Timestamps are UTC and say so with a trailing `Z`, so they line up with
+`journalctl --utc` rather than looking like local time.
+
 Size is shown for file `WRITE` and `RENAME-TO` events via `statx(2)`.
+
+Diagnostics share the same shape, in the `<EVENT>` column: `REBUILD`,
+`Q-OVERFLOW` (kernel queue overflowed, events were lost), `NO-DESCEND` (watched
+but not readable, so its subdirectories are not covered), `WATCH-LIMIT`,
+`LINE-OVERFLOW`, and the `*-ERR` tags. They exist so that every way this tool
+can lose sight of something leaves a line behind.
+
+ocwatch exits non-zero rather than continue in a state where it would observe
+nothing: no watchable root, the last watch gone, or the log file failing to
+accept writes.
 
 ## License
 
