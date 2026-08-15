@@ -100,6 +100,40 @@ WantedBy=default.target
 systemctl --user enable --now ocwatch
 ```
 
+`Restart=on-failure` is load-bearing: ocwatch exits non-zero rather than keep
+running in any state where it would observe nothing, and relies on the
+supervisor to bring it back.
+
+### Rotation
+
+ocwatch does not rotate its own log — that is logrotate's job — but it does
+constrain how: it holds one `O_APPEND` descriptor for the life of the process
+and cannot be told to reopen it, so the file has to be rotated in place.
+
+```
+# /etc/logrotate.d/ocwatch
+/root/.openclaw/logs/ocwatch.log {
+    weekly
+    maxsize 20M
+    rotate 8
+    compress
+    notifempty
+    missingok
+    copytruncate
+}
+```
+
+`copytruncate` is the part that matters. Rotating by rename would leave ocwatch
+writing into an unlinked inode: the new log stays empty and the trail stops
+without a word. `O_APPEND` is what makes the truncate safe — writes re-seek to
+the end, so the file resumes at offset 0 instead of returning as a sparse hole
+the size of the old log. The cost is a small window: anything written between
+the copy and the truncate is lost.
+
+For scale, a monitored `~/.openclaw` produced about 77 KB/day over 120 days,
+compressing to roughly a tenth. Eight weekly generations is a couple of months
+of history in a few megabytes.
+
 ## Event types
 
 | Event             | Meaning                                             |
