@@ -23,6 +23,14 @@ const MAX_WATCH_DIRS = 512;
 const EVENT_BUF_LEN = 4096;
 const DENTS_BUF_LEN = 4096;
 
+// A log line has to hold the longest path we are willing to accept, plus the
+// timestamp, the tag and the size suffix. Sizing it below MAX_PATH means long
+// paths fail to format and the event disappears without a trace — see the
+// drift guard at the bottom of this file.
+const MAX_LOG_LINE = MAX_PATH + 128;
+// The startup line names two paths: the watch root and the log file.
+const MAX_START_LINE = 2 * MAX_PATH + 128;
+
 const AddResult = enum { added, duplicate, full };
 
 // Maps inotify watch descriptor → directory path
@@ -130,9 +138,21 @@ pub fn main(io: std.process.Init.Minimal) !void {
     // Watch dir and all subdirs
     try addWatchRecursive(&ctx, watch_dir);
 
+    // A watcher holding no watches blocks forever on an empty inotify fd. The
+    // process stays alive, the supervisor reports `active (running)`, and
+    // nothing is ever observed — broken in the way that is hardest to notice.
+    // Exiting non-zero is the only honest option: it lets Restart= do its job.
+    if (ctx.map.count == 0) {
+        logSimple(&ctx, "NO-WATCH", watch_dir);
+        writeStr(2, "ocwatch: cannot watch anything under ");
+        writeStr(2, watch_dir);
+        writeStr(2, "\n");
+        return error.NoWatchableRoot;
+    }
+
     // Startup message
     {
-        var msg: [512]u8 = undefined;
+        var msg: [MAX_START_LINE]u8 = undefined;
         const ts = timestamp();
         const line = std.fmt.bufPrint(&msg, "{s}  {s:<12}  watching {s} ({d} dirs) → {s}\n", .{
             &ts, "START", watch_dir, ctx.map.count, log_path,
@@ -161,6 +181,14 @@ pub fn main(io: std.process.Init.Minimal) !void {
             const ev: *const linux.inotify_event = @ptrCast(@alignCast(&buf[offset]));
             handleEvent(&ctx, ev);
             offset += @sizeOf(linux.inotify_event) + ev.len;
+        }
+
+        // The last watch is gone — the root was deleted out from under us.
+        // Nothing can ever arrive on this fd again, so staying in the loop
+        // would be the same silent blindness as starting without a root.
+        if (ctx.map.count == 0) {
+            logSimple(&ctx, "WATCH-LOST", "last watch dropped; exiting to be restarted");
+            return error.AllWatchesLost;
         }
     }
 }
@@ -338,12 +366,18 @@ fn handleEvent(ctx: *Context, ev: *const linux.inotify_event) void {
         }
     }
 
-    var line_buf: [1200]u8 = undefined;
+    var line_buf: [MAX_LOG_LINE]u8 = undefined;
     const ts = timestamp();
     const line = if (extra.len > 0)
-        std.fmt.bufPrint(&line_buf, "{s}  {s:<12}  {s}  {s}\n", .{ &ts, event_str, full_path, extra }) catch return
+        std.fmt.bufPrint(&line_buf, "{s}  {s:<12}  {s}  {s}\n", .{ &ts, event_str, full_path, extra }) catch {
+            logOverflow(ctx, event_str, full_path);
+            return;
+        }
     else
-        std.fmt.bufPrint(&line_buf, "{s}  {s:<12}  {s}\n", .{ &ts, event_str, full_path }) catch return;
+        std.fmt.bufPrint(&line_buf, "{s}  {s:<12}  {s}\n", .{ &ts, event_str, full_path }) catch {
+            logOverflow(ctx, event_str, full_path);
+            return;
+        };
 
     writeLine(ctx, line);
 }
@@ -354,10 +388,22 @@ fn writeLine(ctx: *Context, line: []const u8) void {
 }
 
 fn logSimple(ctx: *Context, tag: []const u8, payload: []const u8) void {
-    var buf: [MAX_PATH + 64]u8 = undefined;
+    var buf: [MAX_LOG_LINE]u8 = undefined;
     const ts = timestamp();
     const line = std.fmt.bufPrint(&buf, "{s}  {s:<12}  {s}\n", .{ &ts, tag, payload }) catch return;
     writeLine(ctx, line);
+}
+
+// MAX_LOG_LINE is sized so this cannot trigger for any path the kernel can
+// hand us. It exists because the previous code answered an unformattable line
+// with a bare `catch return`, which is how writes below deep paths went
+// missing with nothing in the log to suggest anything had been lost. An event
+// we cannot render in full is still an event worth admitting to.
+fn logOverflow(ctx: *Context, event_str: []const u8, path: []const u8) void {
+    var payload: [320]u8 = undefined;
+    const head = path[0..@min(path.len, 200)];
+    const p = std.fmt.bufPrint(&payload, "{s} ({d} bytes, truncated): {s}", .{ event_str, path.len, head }) catch return;
+    logSimple(ctx, "LINE-OVERFLOW", p);
 }
 
 fn writeStr(fd: i32, s: []const u8) void {
@@ -365,7 +411,7 @@ fn writeStr(fd: i32, s: []const u8) void {
 }
 
 fn logErr(ctx: *Context, tag: []const u8, err: linux.E, path: []const u8) void {
-    var buf: [MAX_PATH + 64]u8 = undefined;
+    var buf: [MAX_LOG_LINE]u8 = undefined;
     const payload = std.fmt.bufPrint(&buf, "{s}: {s}", .{ @tagName(err), path }) catch path;
     logSimple(ctx, tag, payload);
 }
@@ -502,6 +548,20 @@ test "WATCH_MASK subscribes to exactly the events eventStr can name" {
         covered |= bit;
     }
     try testing.expectEqual(WATCH_MASK, covered);
+}
+
+test "the log line buffer can hold the longest event we accept" {
+    // Drift guard: a line is timestamp + separator + padded tag + separator +
+    // path + separator + size suffix + newline. Shrinking MAX_LOG_LINE below
+    // that — or raising MAX_PATH without it — brings back the silent drop of
+    // events whose path is longer than the buffer.
+    const longest_tag = "LINE-OVERFLOW".len;
+    const size_suffix = "[18446744073709551615B]".len;
+    const worst_case = 23 + 2 + longest_tag + 2 + MAX_PATH + 2 + size_suffix + 1;
+    try testing.expect(MAX_LOG_LINE >= worst_case);
+
+    // The startup line carries the watch root and the log path together.
+    try testing.expect(MAX_START_LINE >= 23 + 2 + longest_tag + 2 + 2 * MAX_PATH + 64);
 }
 
 test "timestamp has the fixed width the log format relies on" {
